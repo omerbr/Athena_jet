@@ -37,6 +37,9 @@ void JetInnerX3(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceF
 void JetOuterX3(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceField &b,
                 Real time, Real dt,
                 int il, int iu, int jl, int ju, int kl, int ku, int ngh);
+void TransmissiveInnerX1(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceField &b,
+                         Real time, Real dt,
+                         int is, int ie, int js, int je, int ks, int ke, int ngh);
 int RefinementCondition(MeshBlock *pmb);
 
 
@@ -129,7 +132,10 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
     EnrollUserBoundaryFunction(BoundaryFace::outer_x3, JetOuterX3);
   if(adaptive==true)
     EnrollUserRefinementCondition(RefinementCondition);
-  
+
+  // Transmissive boundary conditions on the z axis
+  EnrollUserBoundaryFunction(BoundaryFace::inner_x1, TransmissiveInnerX1);
+
   return;
 }
 
@@ -324,8 +330,7 @@ void JetInnerX3(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceF
     //} else {
     //prim(IDN,kl-k,j,i) = rho_0;
     //}
-	
-	
+           
       }
     }
   }
@@ -419,6 +424,118 @@ void JetOuterX3(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceF
 }
 
 
+// Transmissive boundary conditions on the z axis in cylindrical coordinates.
+// Primitive variables on the inner most cells at angle \theta are coppied to the inner radial ghost cells at angle (\theta+\pi/2). V_r and B_r are flipped (negative flow on one side becomes positive flow on the opther side). V_th, B_th are flipped as well.
+/*
+ 
+ Order of copy radial cell center values,
+ variables at (is+i-1) are copied to (is-i), for i=(1->ngh):
+ |  is+1  |   is   |  is-1  |  is-2  ||  is-2  |  is-1  |   is   |  is+1  |
+     *         &       ^        %         *        &         ^       %
+ 
+ Order of copy radial face center B_x1f,
+ variables at (is+i) are copied to (is-i), for i=(0->ngh), the boundary face is included:
+ |        |        |        |        ||        |        |        |        |
+ is+2     is+1     is       is-1     is-2      is-1     is       is+1     is+2
+ *        &        ^        %        $*        &        ^        %        $
+ 
+ */
+void TransmissiveInnerX1(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceField &b,
+                         Real time, Real dt,
+                         int il, int iu, int jl, int ju, int kl, int ku, int ngh){
+
+    int js = jl, je = ju, n2 = (je-js+1), j_tmp;
+    
+    if (jl==0){// in periodic bc jl starts from 0, (includes ghost cells)
+        js = jl + ngh; //start index of cc computational grid
+        je = ju - ngh; //end index of cc computational grid
+        n2 = je - js +1; // total number of cells minus ghost cells
+    }
+    
+    // Set cell center hydrodynamic variables
+    //for (int n = 0; n < NHYDRO; ++n) { // Loop over hydrodynamic variables
+    for (int k = kl; k <= ku; ++k) { // z-direction
+        for (int j = jl; j <= ju; ++j) { // Azimuthal direction
+            if (j < js) // mirror low grost cells to grid counterparts
+                j_tmp = j + n2;
+            else if (j > je) // mirror top grost cells to grid counterparts
+                j_tmp = j - n2;
+            else // regular cells.
+                j_tmp = j;
+            // Map azimuthal index to the opposite side (phi -> phi + pi)
+            // account for additional ghost cells
+            int jp = (j_tmp - ngh + n2/2) % n2 + ngh;
+#pragma omp simd
+            for (int i = 1; i <= ngh; ++i) { // inner radial ghost zone
+                // Reflect hydrodynamic variables appropriately
+                prim(IDN, k, j, il - i) = prim(IDN, k, jp, il + i - 1); // rho: symmetric
+                prim(IPR, k, j, il - i) = prim(IPR, k, jp, il + i - 1); // P: symmetric
+                prim(IVX, k, j, il - i) = -prim(IVX, k, jp, il + i - 1); // V1: antisymmetric
+                prim(IVY, k, j, il - i) = -prim(IVY, k, jp, il + i - 1); // V2: antisymmetric
+                prim(IVZ, k, j, il - i) = prim(IVZ, k, jp, il + i - 1);  // V3: symmetric
+            }
+        }
+    }
+    //}
+    
+    // Handle magnetic fields if MHD is enabled
+    if (MAGNETIC_FIELDS_ENABLED) {
+        for (int k=kl; k<=ku; ++k) {
+            for (int j=jl; j<=ju; ++j) {
+                if (j < js)           // mirror low grost cells
+                    j_tmp = j + n2;
+                else if (j > je)      // mirror top ghost cells
+                    j_tmp = j - n2;
+                else                  // regular cells
+                    j_tmp = j;
+                // Map azimuthal index to the opposite side (phi -> phi + pi)
+                // account for additional ghost cells
+                int jp = (j_tmp - ngh + n2/2) % n2 + ngh;
+#pragma omp simd
+                for (int i=0; i<=ngh; ++i) {// include the real axial face
+                    b.x1f(k,j,(il-i)) = -b.x1f(k,jp,(il+i));  // 1-field antisymmertic
+                }
+            }
+        }
+        
+        for (int k=kl; k<=ku; ++k) {
+            for (int j=jl; j<=ju+1; ++j) {
+                if (j < js)            // mirror low grost cells
+                    j_tmp = j + n2;
+                else if (j > je +1)    // mirror top grost cells
+                    j_tmp = j - n2;
+                else                   // regular cells
+                    j_tmp = j;
+                // Map azimuthal index to the opposite side (phi -> phi + pi)
+                // account for additional ghost cells
+                int jp = (j_tmp - ngh + n2/2) % n2 + ngh; //(phi -> phi + pi)
+#pragma omp simd
+                for (int i=1; i<=ngh; ++i) {
+                    b.x2f(k,j,(il - i)) =  -b.x2f(k,jp,(il + i- 1)); // 2-field antisymmetric
+                }
+            }
+        }
+        
+        for (int k=kl; k<=ku+1; ++k) {
+            for (int j=jl; j<=ju; ++j) {
+                if (j < js)           // mirror low grost cells
+                    j_tmp = j + n2;
+                else if (j > je)      // mirror top grost cells
+                    j_tmp = j - n2;
+                else                  // regular cells
+                    j_tmp = j;
+                // Map azimuthal index to the opposite side (phi -> phi + pi)
+                // account for additional ghost cells
+                int jp = (j_tmp - ngh + n2/2) % n2 + ngh;
+#pragma omp simd
+                for (int i=1; i<=ngh; ++i) {
+                    b.x3f(k,j,(il - i)) =  b.x3f(k,jp,(il + i - 1)); // 3-field symmetric
+                }
+            }
+        }
+    }
+    return;
+}
 
 
 
