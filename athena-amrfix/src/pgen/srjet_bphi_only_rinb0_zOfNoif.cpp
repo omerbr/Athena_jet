@@ -342,7 +342,7 @@ void JetInnerX3(MeshBlock *pmb, Coordinates *pco, AthenaArray<Real> &prim, FaceF
       for (int j=jl; j<=ju; ++j) {
 	for (int i=il; i<=iu+1; ++i) {
         b.x1f(kl-k,j,i) = 0;
-          
+        
 	}
       }
     } 
